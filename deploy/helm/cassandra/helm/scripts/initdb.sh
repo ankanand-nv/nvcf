@@ -35,6 +35,44 @@ run_cqlsh() {
     sh -c 'read -r CQLSH_U; read -r CQLSH_P; cqlsh -u "$CQLSH_U" -p "$CQLSH_P" "$@"' -- "$@"
 }
 
+# A pod can pass its nodetool-based readiness probe before Cassandra starts
+# accepting CQL connections. Wait for native transport explicitly so a normal
+# startup race is not mistaken for an unknown superuser password.
+wait_for_native_transport() {
+  local pod="$1"
+  local end="$2"
+
+  until [[ $(kubectl exec "${pod}" -c cassandra -n "${namespace}" -- \
+    nodetool statusbinary 2>/dev/null) == "running" ]]; do
+    if [ $SECONDS -gt "$end" ]; then
+      echo "Timeout waiting for Cassandra native transport on pod ${pod}"
+      return 1
+    fi
+    echo "Waiting for Cassandra native transport on pod ${pod}..."
+    sleep 5
+  done
+}
+
+# Native transport can report running before the system_auth roles are ready.
+# Accept either the desired credential or Cassandra's bootstrap credential;
+# ensure_superuser_password below handles the resulting steady state.
+wait_for_superuser_authentication() {
+  local pod="$1"
+  local end=$((SECONDS + 120))
+
+  until run_cqlsh "${pod}" "${CASSANDRA_USER}" "${CASSANDRA_PASSWORD}" \
+    localhost -e "SELECT key FROM system.local;" >/dev/null 2>&1 || \
+    run_cqlsh "${pod}" "${DEFAULT_CASSANDRA_USER}" "${DEFAULT_CASSANDRA_PASSWORD}" \
+      localhost -e "SELECT key FROM system.local;" >/dev/null 2>&1; do
+    if [ $SECONDS -gt "$end" ]; then
+      echo "Timeout waiting for Cassandra superuser authentication on pod ${pod}"
+      return 1
+    fi
+    echo "Waiting for Cassandra superuser authentication on pod ${pod}..."
+    sleep 5
+  done
+}
+
 # How many desired replicas
 
 # Ensure the "cassandra" superuser has the desired dbUser.password.
@@ -112,6 +150,12 @@ initialize_db() {
   echo "All Cassandra pods are ready"
 
   # Always select the 0th pod
+  if ! wait_for_native_transport "${statefulset}-0" "$end"; then
+    return 1
+  fi
+  if ! wait_for_superuser_authentication "${statefulset}-0"; then
+    return 1
+  fi
   if ! ensure_superuser_password "${statefulset}-0"; then
     return 1
   fi

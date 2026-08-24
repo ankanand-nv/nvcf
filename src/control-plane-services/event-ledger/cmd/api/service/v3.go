@@ -507,6 +507,13 @@ func extractK8sEvent(lr *logsv1.LogRecord, fieldsByKind map[string][]string) (*E
 	icmsRequestID := stringAttr(attrs, contextFieldICMSRequestID)
 	kind := detectKind(stringAttr(attrs, "k8s.object.kind"), icmsRequestID)
 
+	// An ICMSRequest event without icms_request_id would collapse to a Pod-like
+	// context missing its join key, letting distinct requests share a dedup key.
+	// Reject it rather than persist an ambiguous row.
+	if kind == kindICMSRequest && icmsRequestID == "" {
+		return nil, fmt.Errorf("ICMSRequest event missing required %s", contextFieldICMSRequestID)
+	}
+
 	// Step 3: Convert wire format to internal context representation
 	contextV3 := ContextV3{
 		InstanceID:         wireFormat.InstanceID,

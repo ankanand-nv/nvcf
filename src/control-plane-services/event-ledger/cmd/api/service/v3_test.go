@@ -679,6 +679,20 @@ func TestExtractK8sEvent_ICMSRequest(t *testing.T) {
 	assert.Equal(t, "ICMSRequest", attrs["k8s.object.kind"])
 }
 
+// TestExtractK8sEvent_ICMSRequestMissingID verifies that an explicit ICMSRequest
+// event without icms_request_id is rejected, so distinct requests cannot collapse
+// onto the same dedup key.
+func TestExtractK8sEvent_ICMSRequestMissingID(t *testing.T) {
+	lr := createOTLPLogRecord("instance.creation", "tenant-123", "nvca", "inst-9", map[string]string{
+		"cluster_id":      "clus-1",
+		"k8s.object.kind": "ICMSRequest",
+	})
+
+	_, err := extractK8sEvent(lr, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "icms_request_id")
+}
+
 // TestExtractK8sEvent_PodKeepsICMSRequestIDInDetails verifies that a Pod event
 // carrying icms_request_id keeps it in details and excludes it from context.
 func TestExtractK8sEvent_PodKeepsICMSRequestIDInDetails(t *testing.T) {

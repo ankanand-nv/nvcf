@@ -129,6 +129,23 @@ type EventsV3Response struct {
 	Events    []EventV3Item `json:"events"`
 }
 
+// Object kinds that drive kind-aware context formation. Values match the
+// k8s.object.kind attribute emitted by the NVCA OTel collector.
+const (
+	kindPod         = "Pod"
+	kindICMSRequest = "ICMSRequest"
+)
+
+// Context field names. These are the keys used both in the canonical context
+// string and in the config-driven kind->fields map.
+const (
+	contextFieldClusterID          = "cluster_id"
+	contextFieldDeploymentID       = "deployment_id"
+	contextFieldGPUSpecificationID = "gpu_specification_id"
+	contextFieldInstanceID         = "instance_id"
+	contextFieldICMSRequestID      = "icms_request_id"
+)
+
 // ContextV3 represents the context components that identify the scope of an event
 // This is the internal representation, not tied to any wire format
 type ContextV3 struct {
@@ -136,6 +153,63 @@ type ContextV3 struct {
 	DeploymentID       string
 	GPUSpecificationID string
 	ClusterID          string
+	ICMSRequestID      string
+}
+
+// DefaultContextFieldsByKind returns the built-in kind->context-fields map used
+// when config supplies no override. Pod keeps the original four-field context so
+// existing consumers are unaffected; ICMSRequest is identified by icms_request_id.
+// The slice order defines the canonical string order for that kind.
+func DefaultContextFieldsByKind() map[string][]string {
+	return map[string][]string{
+		kindPod: {
+			contextFieldClusterID,
+			contextFieldDeploymentID,
+			contextFieldGPUSpecificationID,
+			contextFieldInstanceID,
+		},
+		kindICMSRequest: {
+			contextFieldClusterID,
+			contextFieldICMSRequestID,
+			contextFieldInstanceID,
+		},
+	}
+}
+
+// resolveContextFields returns the ordered context fields for the given kind,
+// falling back to the built-in defaults (and finally to the Pod field set for
+// unknown kinds) so behavior is always well-defined.
+func resolveContextFields(kind string, fieldsByKind map[string][]string) []string {
+	if fields, ok := fieldsByKind[kind]; ok && len(fields) > 0 {
+		return fields
+	}
+	defaults := DefaultContextFieldsByKind()
+	if fields, ok := defaults[kind]; ok {
+		return fields
+	}
+	return defaults[kindPod]
+}
+
+// detectKind resolves the object kind for an event. An explicit k8s.object.kind
+// wins; otherwise the presence of icms_request_id marks an ICMSRequest event;
+// otherwise it defaults to Pod (backward compatible with existing Pod traffic).
+func detectKind(explicitKind, icmsRequestID string) string {
+	if explicitKind != "" {
+		return explicitKind
+	}
+	if icmsRequestID != "" {
+		return kindICMSRequest
+	}
+	return kindPod
+}
+
+// stringAttr reads a string attribute from a decoded OTLP attribute map,
+// returning "" when absent or not a string.
+func stringAttr(attrs map[string]any, key string) string {
+	if v, ok := attrs[key].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // cloudEventWireFormat represents the CloudEvents extensions wire format
@@ -270,7 +344,7 @@ func (s *Server) processOTLPEvents(traceCtx context.Context, req *collectorlogsv
 	for _, rl := range req.ResourceLogs {
 		for _, sl := range rl.ScopeLogs {
 			for _, lr := range sl.LogRecords {
-				event, err := extractK8sEvent(lr)
+				event, err := extractK8sEvent(lr, s.contextFieldsByKind)
 				if err != nil {
 					logger.WarnContext(traceCtx, "Skipping event", zap.Error(err))
 					result.FailureCount++
@@ -361,10 +435,21 @@ func deduplicateEvents(events []*EventV3) []*EventV3 {
 	return result
 }
 
-// eventContextToCanonical converts a ContextV3 struct to a canonical string representation
-// Format: key1=value1,key2=value2 (alphabetical order: cluster_id, deployment_id, gpu_specification_id, instance_id)
-// Validates that values contain only alphanumeric characters and dashes. Empty fields are omitted.
-func eventContextToCanonical(eventContext ContextV3) (string, error) {
+// eventContextToCanonical converts a ContextV3 struct to a canonical string
+// representation using the supplied ordered field list (kind-aware).
+// Format: key1=value1,key2=value2 in the order given by fields.
+// Validates that values contain only alphanumeric characters and dashes. Empty
+// fields are omitted. Passing the Pod field set reproduces the original
+// alphabetical cluster_id,deployment_id,gpu_specification_id,instance_id output.
+func eventContextToCanonical(eventContext ContextV3, fields []string) (string, error) {
+	values := map[string]string{
+		contextFieldClusterID:          eventContext.ClusterID,
+		contextFieldDeploymentID:       eventContext.DeploymentID,
+		contextFieldGPUSpecificationID: eventContext.GPUSpecificationID,
+		contextFieldInstanceID:         eventContext.InstanceID,
+		contextFieldICMSRequestID:      eventContext.ICMSRequestID,
+	}
+
 	// Helper to validate field values
 	validate := func(name, value string) error {
 		if value != "" && !contextFieldPattern.MatchString(value) {
@@ -378,33 +463,18 @@ func eventContextToCanonical(eventContext ContextV3) (string, error) {
 		return nil
 	}
 
-	// Validate all fields
-	if err := validate("cluster_id", eventContext.ClusterID); err != nil {
-		return "", err
-	}
-	if err := validate("deployment_id", eventContext.DeploymentID); err != nil {
-		return "", err
-	}
-	if err := validate("gpu_specification_id", eventContext.GPUSpecificationID); err != nil {
-		return "", err
-	}
-	if err := validate("instance_id", eventContext.InstanceID); err != nil {
-		return "", err
-	}
-
-	// Build canonical string in alphabetical order (with underscores)
-	parts := make([]string, 0, 4)
-	if eventContext.ClusterID != "" {
-		parts = append(parts, "cluster_id="+eventContext.ClusterID)
-	}
-	if eventContext.DeploymentID != "" {
-		parts = append(parts, "deployment_id="+eventContext.DeploymentID)
-	}
-	if eventContext.GPUSpecificationID != "" {
-		parts = append(parts, "gpu_specification_id="+eventContext.GPUSpecificationID)
-	}
-	if eventContext.InstanceID != "" {
-		parts = append(parts, "instance_id="+eventContext.InstanceID)
+	parts := make([]string, 0, len(fields))
+	for _, name := range fields {
+		value, ok := values[name]
+		if !ok {
+			return "", fmt.Errorf("unknown context field %q", name)
+		}
+		if err := validate(name, value); err != nil {
+			return "", err
+		}
+		if value != "" {
+			parts = append(parts, name+"="+value)
+		}
 	}
 
 	return strings.Join(parts, ","), nil
@@ -416,7 +486,10 @@ func eventContextToCanonical(eventContext ContextV3) (string, error) {
 //   - namespace (string): Tenant identifier
 //   - source (string): Event source identifier
 //   - Context fields (optional): instance_id, deployment_id, gpu_specification_id, cluster_id
-func extractK8sEvent(lr *logsv1.LogRecord) (*EventV3, error) {
+//   - icms_request_id, k8s.object.kind (optional): drive kind-aware context formation.
+//     These remain in details for Pod events; for ICMSRequest events icms_request_id
+//     additionally participates in the canonical context.
+func extractK8sEvent(lr *logsv1.LogRecord, fieldsByKind map[string][]string) (*EventV3, error) {
 	// Step 1: Convert OTLP protobuf attributes to map
 	attrs := make(map[string]any)
 	for _, attr := range lr.Attributes {
@@ -429,15 +502,21 @@ func extractK8sEvent(lr *logsv1.LogRecord) (*EventV3, error) {
 		return nil, fmt.Errorf("failed to decode OTLP attributes: %w", err)
 	}
 
+	// icms_request_id and k8s.object.kind are intentionally read from the raw
+	// attribute map (not the typed wire format) so they remain in details.
+	icmsRequestID := stringAttr(attrs, contextFieldICMSRequestID)
+	kind := detectKind(stringAttr(attrs, "k8s.object.kind"), icmsRequestID)
+
 	// Step 3: Convert wire format to internal context representation
 	contextV3 := ContextV3{
 		InstanceID:         wireFormat.InstanceID,
 		DeploymentID:       wireFormat.DeploymentID,
 		GPUSpecificationID: wireFormat.GPUSpecificationID,
 		ClusterID:          wireFormat.ClusterID,
+		ICMSRequestID:      icmsRequestID,
 	}
 
-	canonicalContext, err := eventContextToCanonical(contextV3)
+	canonicalContext, err := eventContextToCanonical(contextV3, resolveContextFields(kind, fieldsByKind))
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert context to canonical format: %w", err)
 	}
@@ -487,7 +566,7 @@ func extractK8sEvent(lr *logsv1.LogRecord) (*EventV3, error) {
 //   - namespace (required)
 //   - Context fields (optional, camelCase): instanceId, deploymentId, gpuSpecificationId, clusterId
 //     Note: CloudEvents spec forbids underscores in extension names, so we use camelCase
-func extractCloudEvent(ce *cloudevents.Event) (*EventV3, error) {
+func extractCloudEvent(ce *cloudevents.Event, fieldsByKind map[string][]string) (*EventV3, error) {
 	// Validate required CloudEvents fields per spec (using CloudEvents field names in errors)
 	if strings.TrimSpace(ce.ID()) == "" {
 		return nil, errors.New("missing required field: id")
@@ -513,7 +592,9 @@ func extractCloudEvent(ce *cloudevents.Event) (*EventV3, error) {
 		ClusterID:          wireFormat.ClusterID,
 	}
 
-	canonicalContext, err := eventContextToCanonical(contextV3)
+	// CloudEvents are Pod-shaped, but honor any configured Pod override so the
+	// context string matches OTLP ingestion and GetEventsV3 lookups.
+	canonicalContext, err := eventContextToCanonical(contextV3, resolveContextFields(kindPod, fieldsByKind))
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert context to canonical format: %w", err)
 	}
@@ -710,7 +791,7 @@ func (s *Server) PostCloudEventV3(w http.ResponseWriter, r *http.Request) {
 
 	result := EventProcessingResult{ProcessedEvents: make([]ProcessedEventSummary, 0, len(events))}
 	for _, event := range events {
-		eventV3, err := extractCloudEvent(event)
+		eventV3, err := extractCloudEvent(event, s.contextFieldsByKind)
 		if err != nil {
 			logger.WarnContext(traceCtx, "Skipping event", zap.Error(err))
 			result.FailureCount++
@@ -883,15 +964,21 @@ func (s *Server) GetEventsV3(w http.ResponseWriter, r *http.Request) {
 
 	// Extract context components from query parameters
 	queryParams := r.URL.Query()
+	icmsRequestID := queryParams.Get(contextFieldICMSRequestID)
 	contextV3 := ContextV3{
 		InstanceID:         queryParams.Get("instance_id"),
 		DeploymentID:       queryParams.Get("deployment_id"),
 		GPUSpecificationID: queryParams.Get("gpu_specification_id"),
 		ClusterID:          queryParams.Get("cluster_id"),
+		ICMSRequestID:      icmsRequestID,
 	}
 
+	// icms_request_id selects the ICMSRequest context shape so callers can look
+	// up request-level rows; otherwise the Pod context shape is used.
+	kind := detectKind(queryParams.Get("kind"), icmsRequestID)
+
 	// Convert ContextV3 to canonical string
-	eventContext, err := eventContextToCanonical(contextV3)
+	eventContext, err := eventContextToCanonical(contextV3, resolveContextFields(kind, s.contextFieldsByKind))
 	if err != nil {
 		logger.WarnContext(traceCtx, "Invalid context query parameters",
 			zap.Error(err))

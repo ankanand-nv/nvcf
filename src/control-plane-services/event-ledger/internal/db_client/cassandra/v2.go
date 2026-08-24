@@ -1287,13 +1287,15 @@ func (c *CassandraHandler) upsertPartitionStatsV3(traceCtx context.Context, name
 	logger := logging.GetLogger(traceCtx)
 
 	return c.executeWithSessionRecreation(traceCtx, func() error {
-		selectQuery := `SELECT context, created_at FROM stats_v3 WHERE namespace = ?`
+		selectQuery := `SELECT context, created_at, timestamp FROM stats_v3 WHERE namespace = ?`
 		iter := c.session.Query(selectQuery, namespace).WithContext(traceCtx).Iter()
 		existingCreatedAt := make(map[string]time.Time)
+		existingTimestamp := make(map[string]time.Time)
 		var scannedContext string
-		var scannedCreatedAt time.Time
-		for iter.Scan(&scannedContext, &scannedCreatedAt) {
+		var scannedCreatedAt, scannedTimestamp time.Time
+		for iter.Scan(&scannedContext, &scannedCreatedAt, &scannedTimestamp) {
 			existingCreatedAt[scannedContext] = scannedCreatedAt
+			existingTimestamp[scannedContext] = scannedTimestamp
 		}
 		if err := iter.Close(); err != nil {
 			logger.ErrorContext(traceCtx, "Failed to fetch existing stats for namespace",
@@ -1305,12 +1307,29 @@ func (c *CassandraHandler) upsertPartitionStatsV3(traceCtx context.Context, name
 		insertQuery := `INSERT INTO stats_v3 (namespace, context, event_name, timestamp, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`
 		batch := c.session.NewBatch(gocql.UnloggedBatch).WithContext(traceCtx)
 		now := time.Now()
+		skipped := 0
 		for _, ev := range events {
+			// A stats row holds the latest event per context; skip events that are
+			// older than the row already stored so out-of-order delivery cannot
+			// overwrite a newer event. This read-then-write guard is best-effort:
+			// concurrent writers to the same (namespace, context) can still race.
+			// Full atomicity (conditional LWT) is tracked as a follow-up.
+			if ts, exists := existingTimestamp[ev.Context]; exists && ev.Timestamp.Before(ts) {
+				skipped++
+				continue
+			}
 			createdAt := ev.Timestamp
 			if ca, exists := existingCreatedAt[ev.Context]; exists {
 				createdAt = ca
 			}
 			batch.Query(insertQuery, ev.Namespace, ev.Context, ev.EventName, ev.Timestamp, createdAt, now)
+		}
+
+		if batch.Size() == 0 {
+			logger.InfoContext(traceCtx, "No stats to insert after out-of-order filtering",
+				zap.String("namespace", namespace),
+				zap.Int("skipped", skipped))
+			return nil
 		}
 
 		if err := c.session.ExecuteBatch(batch); err != nil {
@@ -1322,7 +1341,8 @@ func (c *CassandraHandler) upsertPartitionStatsV3(traceCtx context.Context, name
 
 		logger.InfoContext(traceCtx, "Batch inserted stats",
 			zap.String("namespace", namespace),
-			zap.Int("count", len(events)))
+			zap.Int("count", batch.Size()),
+			zap.Int("skipped", skipped))
 		return nil
 	}, "upsertPartitionStatsV3")
 }
@@ -1383,6 +1403,20 @@ func (c *CassandraHandler) upsertStatsRow(traceCtx context.Context, table, names
 		}
 
 		if !applied {
+			// Guard against out-of-order delivery: a stats row reflects the latest
+			// event for a context, so an older event must not overwrite a newer one.
+			// Best-effort (read-then-write); concurrent writers can still race.
+			// Full atomicity (conditional LWT) is tracked as a follow-up.
+			if timestamp.Before(existingTimestamp) {
+				logger.DebugContext(traceCtx, "Skipping stats update for out-of-order event",
+					zap.String("table", table),
+					zap.String("namespace", namespace),
+					zap.String("context", eventContext),
+					zap.Time("event_timestamp", timestamp),
+					zap.Time("existing_timestamp", existingTimestamp))
+				return nil
+			}
+
 			// Record exists - update it preserving created_at, replacing event_name
 			updateQuery := fmt.Sprintf(`INSERT INTO %s (namespace, context, event_name, timestamp, created_at, updated_at)
 							VALUES (?, ?, ?, ?, ?, ?)`, table)

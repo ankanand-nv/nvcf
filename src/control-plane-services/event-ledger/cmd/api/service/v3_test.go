@@ -575,7 +575,7 @@ func TestExtractK8sEvent(t *testing.T) {
 		"extra_field": "extra_value",
 	})
 
-	event, err := extractK8sEvent(lr)
+	event, err := extractK8sEvent(lr, nil)
 	require.NoError(t, err)
 
 	// Check struct fields
@@ -603,6 +603,122 @@ func TestExtractK8sEvent(t *testing.T) {
 	assert.Equal(t, "extra_value", attrs["extra_field"])
 }
 
+// TestEventContextToCanonical_KindAware verifies canonical string formation per kind.
+func TestEventContextToCanonical_KindAware(t *testing.T) {
+	ctx := ContextV3{
+		InstanceID:    "inst-1",
+		ClusterID:     "clus-1",
+		DeploymentID:  "dep-1",
+		ICMSRequestID: "icms-1",
+	}
+
+	tests := []struct {
+		name   string
+		kind   string
+		expect string
+	}{
+		{
+			name:   "pod keeps original four-field shape and omits icms_request_id",
+			kind:   kindPod,
+			expect: "cluster_id=clus-1,deployment_id=dep-1,instance_id=inst-1",
+		},
+		{
+			name:   "icms request uses icms_request_id and drops deployment_id",
+			kind:   kindICMSRequest,
+			expect: "cluster_id=clus-1,icms_request_id=icms-1,instance_id=inst-1",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := eventContextToCanonical(ctx, resolveContextFields(tc.kind, nil))
+			require.NoError(t, err)
+			assert.Equal(t, tc.expect, got)
+		})
+	}
+}
+
+// TestDetectKind covers the inference rules for object kind.
+func TestDetectKind(t *testing.T) {
+	tests := []struct {
+		name          string
+		explicitKind  string
+		icmsRequestID string
+		expect        string
+	}{
+		{name: "explicit kind wins", explicitKind: kindICMSRequest, icmsRequestID: "", expect: kindICMSRequest},
+		{name: "icms_request_id infers ICMSRequest", explicitKind: "", icmsRequestID: "icms-1", expect: kindICMSRequest},
+		{name: "default is Pod", explicitKind: "", icmsRequestID: "", expect: kindPod},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expect, detectKind(tc.explicitKind, tc.icmsRequestID))
+		})
+	}
+}
+
+// TestExtractK8sEvent_ICMSRequest verifies that an ICMSRequest event uses the
+// icms_request_id in its context while retaining it in details.
+func TestExtractK8sEvent_ICMSRequest(t *testing.T) {
+	lr := createOTLPLogRecord("instance.creation", "tenant-123", "nvca", "inst-9", map[string]string{
+		"cluster_id":      "clus-1",
+		"icms_request_id": "icms-abc",
+		"k8s.object.kind": "ICMSRequest",
+	})
+
+	event, err := extractK8sEvent(lr, nil)
+	require.NoError(t, err)
+
+	// Context is the ICMSRequest shape: cluster_id, icms_request_id, instance_id.
+	assert.Equal(t, "cluster_id=clus-1,icms_request_id=icms-abc,instance_id=inst-9", event.Context)
+
+	var details map[string]any
+	require.NoError(t, json.Unmarshal(event.DetailsJSON, &details))
+	attrs := details["attributes"].(map[string]any)
+	// icms_request_id and k8s.object.kind remain in details.
+	assert.Equal(t, "icms-abc", attrs["icms_request_id"])
+	assert.Equal(t, "ICMSRequest", attrs["k8s.object.kind"])
+}
+
+// TestExtractK8sEvent_PodKeepsICMSRequestIDInDetails verifies that a Pod event
+// carrying icms_request_id keeps it in details and excludes it from context.
+func TestExtractK8sEvent_PodKeepsICMSRequestIDInDetails(t *testing.T) {
+	lr := createOTLPLogRecord("pod.ready", "tenant-123", "kubernetes", "pod-1", map[string]string{
+		"cluster_id":      "clus-1",
+		"icms_request_id": "icms-xyz",
+		"k8s.object.kind": "Pod",
+	})
+
+	event, err := extractK8sEvent(lr, nil)
+	require.NoError(t, err)
+
+	// Pod context stays the original shape and excludes icms_request_id.
+	assert.Equal(t, "cluster_id=clus-1,instance_id=pod-1", event.Context)
+	assert.NotContains(t, event.Context, "icms_request_id")
+
+	var details map[string]any
+	require.NoError(t, json.Unmarshal(event.DetailsJSON, &details))
+	attrs := details["attributes"].(map[string]any)
+	assert.Equal(t, "icms-xyz", attrs["icms_request_id"])
+}
+
+// TestSetContextFieldsByKind verifies config override merges over defaults.
+func TestSetContextFieldsByKind(t *testing.T) {
+	s := newServerWithMock(t, &mockDBHandlerV3{})
+
+	// Override only ICMSRequest; Pod must keep its default.
+	s.SetContextFieldsByKind(map[string][]string{
+		kindICMSRequest: {contextFieldICMSRequestID},
+	})
+
+	assert.Equal(t, DefaultContextFieldsByKind()[kindPod], s.contextFieldsByKind[kindPod])
+	assert.Equal(t, []string{contextFieldICMSRequestID}, s.contextFieldsByKind[kindICMSRequest])
+
+	// Empty override is a no-op.
+	before := s.contextFieldsByKind
+	s.SetContextFieldsByKind(nil)
+	assert.Equal(t, before, s.contextFieldsByKind)
+}
+
 // Test extractCloudEvent validates source is required
 func TestExtractCloudEvent_SourceRequired(t *testing.T) {
 	ce := cloudevents.NewEvent()
@@ -611,7 +727,7 @@ func TestExtractCloudEvent_SourceRequired(t *testing.T) {
 	ce.SetSource("") // Empty source
 	ce.SetExtension("namespace", "test-namespace")
 
-	_, err := extractCloudEvent(&ce)
+	_, err := extractCloudEvent(&ce, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing required field: source")
 }
@@ -624,7 +740,7 @@ func TestExtractCloudEvent_TypeRequired(t *testing.T) {
 	ce.SetSource("/test")
 	ce.SetExtension("namespace", "test-namespace")
 
-	_, err := extractCloudEvent(&ce)
+	_, err := extractCloudEvent(&ce, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing required field: type")
 }
@@ -637,9 +753,34 @@ func TestExtractCloudEvent_IdRequired(t *testing.T) {
 	ce.SetSource("/test")
 	ce.SetExtension("namespace", "test-namespace")
 
-	_, err := extractCloudEvent(&ce)
+	_, err := extractCloudEvent(&ce, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing required field: id")
+}
+
+// TestExtractCloudEvent_HonorsPodOverride verifies that a configured Pod field
+// override is applied to CloudEvents, so their context string matches OTLP
+// ingestion and GetEventsV3 lookups (i.e. rows stay queryable).
+func TestExtractCloudEvent_HonorsPodOverride(t *testing.T) {
+	ce := cloudevents.NewEvent()
+	ce.SetID("test-id")
+	ce.SetType("test.event")
+	ce.SetSource("/test")
+	ce.SetExtension("namespace", "tenant-1")
+	ce.SetExtension("clusterId", "clus-1")
+	ce.SetExtension("instanceId", "inst-1")
+
+	// Non-default Pod mapping: only cluster_id participates in the context.
+	override := map[string][]string{kindPod: {contextFieldClusterID}}
+
+	event, err := extractCloudEvent(&ce, override)
+	require.NoError(t, err)
+	assert.Equal(t, "cluster_id=clus-1", event.Context)
+
+	// Default mapping still includes instance_id, confirming the override took effect.
+	def, err := extractCloudEvent(&ce, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "cluster_id=clus-1,instance_id=inst-1", def.Context)
 }
 
 // ======================

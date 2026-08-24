@@ -55,6 +55,7 @@ type Config struct {
 	HTTP               HTTPClientConfig       `mapstructure:"http"`
 	Pagination         PaginationConfig       `mapstructure:"pagination"`
 	Stats              StatsConfig            `mapstructure:"stats"`
+	Context            ContextConfig          `mapstructure:"context"`
 	ID                 string                 `mapstructure:"id"`
 	Secret             string                 `mapstructure:"secret"`
 	DeprecateEndpoints bool                   `mapstructure:"deprecate-endpoints"`
@@ -232,6 +233,15 @@ type StatsConfig struct {
 	// FilteredStatsEnabledEventNames lists which event names should update the filtered stats view.
 	// The mapstructure key is retained for compatibility. If empty, the view is disabled (no writes).
 	FilteredStatsEnabledEventNames []string `mapstructure:"ngc-stats-enabled-event-names"`
+}
+
+// ContextConfig configures kind-aware canonical context formation.
+type ContextConfig struct {
+	// FieldsByKind maps an object kind (e.g. "Pod", "ICMSRequest") to the ordered
+	// list of context fields that form its canonical context string. When empty,
+	// the service falls back to its built-in defaults. Kinds omitted here keep
+	// their built-in defaults.
+	FieldsByKind map[string][]string `mapstructure:"fields-by-kind"`
 }
 
 // WithDefaults returns a PaginationConfig with default values for unset fields

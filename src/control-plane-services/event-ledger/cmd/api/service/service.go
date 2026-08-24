@@ -76,6 +76,10 @@ type Server struct {
 	statsConfig             config.StatsConfig
 	statsEventNames         map[string]struct{}
 	filteredStatsEventNames map[string]struct{}
+	// contextFieldsByKind maps an object kind (e.g. Pod, ICMSRequest) to the
+	// ordered context fields used to form the canonical context string.
+	// It defaults to DefaultContextFieldsByKind and may be overridden via config.
+	contextFieldsByKind map[string][]string
 }
 
 func NewServer(conns Connections, logger *otelzap.Logger, publisher interfaces.EventPublisher, version string, httpConfig *config.HTTPClientConfig, paginationConfig config.PaginationConfig, statsConfig config.StatsConfig) *Server {
@@ -100,7 +104,23 @@ func NewServer(conns Connections, logger *otelzap.Logger, publisher interfaces.E
 		statsConfig,
 		statsEventNames,
 		filteredStatsEventNames,
+		DefaultContextFieldsByKind(),
 	}
+}
+
+// SetContextFieldsByKind overrides the kind->context-fields map. Kinds absent
+// from the override retain their built-in defaults, so partial config is safe.
+func (s *Server) SetContextFieldsByKind(fieldsByKind map[string][]string) {
+	if len(fieldsByKind) == 0 {
+		return
+	}
+	merged := DefaultContextFieldsByKind()
+	for kind, fields := range fieldsByKind {
+		if len(fields) > 0 {
+			merged[kind] = fields
+		}
+	}
+	s.contextFieldsByKind = merged
 }
 
 func (s *Server) WriteStageTransitionEvent(traceCtx context.Context, ste types.StageTransitionEvent) error {

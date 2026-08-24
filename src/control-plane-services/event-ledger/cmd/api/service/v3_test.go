@@ -124,6 +124,15 @@ func (m *mockDBHandlerV3) BulkUpsertStatsV3(ctx context.Context, events []data_a
 	return nil
 }
 
+// Instance-summary test fixtures: one ICMSRequest-lane context and two Pod-lane
+// contexts (inst-1 correlated to icms-1, inst-2 correlated to icms-2).
+const (
+	summaryNS      = "summary-ns"
+	summaryICMSCtx = "cluster_id=c1,icms_request_id=icms-1,instance_id=inst-1"
+	summaryPodCtx1 = "cluster_id=c1,deployment_id=d1,gpu_specification_id=g1,instance_id=inst-1"
+	summaryPodCtx2 = "cluster_id=c1,deployment_id=d1,gpu_specification_id=g1,instance_id=inst-2"
+)
+
 func (m *mockDBHandlerV3) GetStatsV3(ctx context.Context, namespace string) ([]data_access.StatsV3Record, error) {
 	m.getStatsCalls++
 	// Return mock data based on namespace
@@ -133,6 +142,14 @@ func (m *mockDBHandlerV3) GetStatsV3(ctx context.Context, namespace string) ([]d
 			{Context: "pod-1", EventName: "pending", Timestamp: now, CreatedAt: now.Add(-time.Hour), UpdatedAt: now},
 			{Context: "pod-2", EventName: "pending", Timestamp: now, CreatedAt: now.Add(-time.Hour), UpdatedAt: now},
 			{Context: "pod-3", EventName: "ready", Timestamp: now, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now},
+		}, nil
+	}
+	if namespace == summaryNS {
+		now := time.Now()
+		return []data_access.StatsV3Record{
+			{Context: summaryICMSCtx, EventName: "InstanceTermination", Timestamp: now, CreatedAt: now.Add(-time.Hour), UpdatedAt: now},
+			{Context: summaryPodCtx1, EventName: "ready", Timestamp: now, CreatedAt: now.Add(-time.Hour), UpdatedAt: now},
+			{Context: summaryPodCtx2, EventName: "ready", Timestamp: now, CreatedAt: now.Add(-time.Hour), UpdatedAt: now},
 		}, nil
 	}
 	if namespace == "empty-namespace" {
@@ -182,6 +199,29 @@ func (m *mockDBHandlerV3) GetEventsV3(ctx context.Context, namespace, eventConte
 	}
 	// Empty context is allowed - return empty results
 	if namespace == "test-namespace" && eventContext == "" {
+		return []data_access.EventV3Record{}, nil
+	}
+	if namespace == summaryNS {
+		now := time.Now()
+		switch eventContext {
+		case summaryICMSCtx:
+			created, _ := json.Marshal(EventDetails{Attributes: map[string]any{"icms_request_id": "icms-1"}})
+			terminated, _ := json.Marshal(EventDetails{Attributes: map[string]any{"icms_request_id": "icms-1", "failure_category": "None"}})
+			return []data_access.EventV3Record{
+				{EventName: "InstanceCreation", Source: "nvca", Details: created, Timestamp: now.Add(-10 * time.Minute), CreatedAt: now.Add(-10 * time.Minute), UpdatedAt: now.Add(-10 * time.Minute)},
+				{EventName: "InstanceTermination", Source: "nvca", Details: terminated, Timestamp: now, CreatedAt: now.Add(-time.Minute), UpdatedAt: now},
+			}, nil
+		case summaryPodCtx1:
+			d, _ := json.Marshal(EventDetails{Body: "Pod ready", Attributes: map[string]any{"icms_request_id": "icms-1"}})
+			return []data_access.EventV3Record{
+				{EventName: "ready", Source: "kubelet", Details: d, Timestamp: now.Add(-2 * time.Minute), CreatedAt: now.Add(-5 * time.Minute), UpdatedAt: now},
+			}, nil
+		case summaryPodCtx2:
+			d, _ := json.Marshal(EventDetails{Body: "Pod ready", Attributes: map[string]any{"icms_request_id": "icms-2"}})
+			return []data_access.EventV3Record{
+				{EventName: "ready", Source: "kubelet", Details: d, Timestamp: now, CreatedAt: now, UpdatedAt: now},
+			}, nil
+		}
 		return []data_access.EventV3Record{}, nil
 	}
 	return nil, fmt.Errorf("context not found")
@@ -1073,6 +1113,93 @@ func TestGetEventsV3_Success(t *testing.T) {
 	assert.NotZero(t, response.Events[0].Timestamp)
 	assert.NotZero(t, response.Events[0].CreatedAt)
 	assert.NotZero(t, response.Events[0].UpdatedAt)
+}
+
+// newInstanceSummaryRequest builds a GET instance-summary request wired with a
+// trace logger and the namespace path var.
+func newInstanceSummaryRequest(t *testing.T, namespace, query string) *http.Request {
+	t.Helper()
+	logger := testutils.InitTestLogger(t)
+	req := httptest.NewRequest("GET", "/v3/ledger/namespace/"+namespace+"/instance-summary"+query, nil)
+	ctx := req.Context()
+	ctx = context.WithValue(ctx, logging.LoggerKey, logging.NewTraceLogger(ctx, logger))
+	req = req.WithContext(ctx)
+	return mux.SetURLVars(req, map[string]string{"namespace": namespace})
+}
+
+// TestGetInstanceSummaryV3_JoinsLanes verifies the ICMS outcome and the Pod-lane
+// events correlated on icms_request_id are returned in one call, and that
+// unrelated pods (different icms_request_id) are excluded.
+func TestGetInstanceSummaryV3_JoinsLanes(t *testing.T) {
+	logger := testutils.InitTestLogger(t)
+	server := NewServer(
+		Connections{DbHandlerV2: &mockDBHandlerV3{}},
+		logger, nil, "test", &config.HTTPClientConfig{}, config.PaginationConfig{}, config.StatsConfig{},
+	)
+
+	req := newInstanceSummaryRequest(t, summaryNS, "?icms_request_id=icms-1")
+	w := httptest.NewRecorder()
+	server.GetInstanceSummaryV3(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var response InstanceSummaryResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+
+	assert.Equal(t, summaryNS, response.Namespace)
+	assert.Equal(t, "icms-1", response.ICMSRequestID)
+
+	// Outcome comes from the ICMSRequest lane; latest event wins.
+	require.NotNil(t, response.Outcome)
+	assert.Equal(t, summaryICMSCtx, response.Outcome.Context)
+	assert.Equal(t, "InstanceTermination", response.Outcome.LatestEvent)
+	assert.Equal(t, "inst-1", response.Outcome.InstanceID)
+	assert.Equal(t, "c1", response.Outcome.ClusterID)
+	assert.Len(t, response.Outcome.Events, 2)
+	// Outcome events are most-recent-first.
+	assert.Equal(t, "InstanceTermination", response.Outcome.Events[0].EventName)
+
+	// Only the pod correlated to icms-1 is included; inst-2 (icms-2) is excluded.
+	require.Len(t, response.PodEvents, 1)
+	assert.Equal(t, summaryPodCtx1, response.PodEvents[0].Context)
+	assert.Equal(t, "ready", response.PodEvents[0].EventName)
+	assert.Equal(t, "icms-1", response.PodEvents[0].Details.Attributes["icms_request_id"])
+}
+
+// TestGetInstanceSummaryV3_RequiresICMSRequestID verifies the join key is required.
+func TestGetInstanceSummaryV3_RequiresICMSRequestID(t *testing.T) {
+	logger := testutils.InitTestLogger(t)
+	server := NewServer(
+		Connections{DbHandlerV2: &mockDBHandlerV3{}},
+		logger, nil, "test", &config.HTTPClientConfig{}, config.PaginationConfig{}, config.StatsConfig{},
+	)
+
+	req := newInstanceSummaryRequest(t, summaryNS, "")
+	w := httptest.NewRecorder()
+	server.GetInstanceSummaryV3(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestGetInstanceSummaryV3_NoData verifies a namespace with no contexts yields a
+// nil outcome and no pod events (and does not error).
+func TestGetInstanceSummaryV3_NoData(t *testing.T) {
+	logger := testutils.InitTestLogger(t)
+	server := NewServer(
+		Connections{DbHandlerV2: &mockDBHandlerV3{}},
+		logger, nil, "test", &config.HTTPClientConfig{}, config.PaginationConfig{}, config.StatsConfig{},
+	)
+
+	req := newInstanceSummaryRequest(t, "empty-namespace", "?icms_request_id=icms-1")
+	w := httptest.NewRecorder()
+	server.GetInstanceSummaryV3(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var response InstanceSummaryResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Nil(t, response.Outcome)
+	assert.Empty(t, response.PodEvents)
 }
 
 // Test GetEventsV3 with empty result

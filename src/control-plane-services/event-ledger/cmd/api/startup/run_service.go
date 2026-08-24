@@ -462,6 +462,11 @@ func runService(cfg config.Config) error {
 		middleware.MaybeRequireScopes(logger, requireLocalScopeCheck, middleware.ReadScopes, middleware.RequireAnyScopes)(http.HandlerFunc(server.GetEventsV3)),
 	).Methods("GET", "OPTIONS")
 
+	// V3 Instance-summary endpoint - join Pod + ICMSRequest lanes on icms_request_id (read-only)
+	authRouter.Handle("/v3/ledger/namespace/{namespace}/instance-summary",
+		middleware.MaybeRequireScopes(logger, requireLocalScopeCheck, middleware.ReadScopes, middleware.RequireAnyScopes)(http.HandlerFunc(server.GetInstanceSummaryV3)),
+	).Methods("GET", "OPTIONS")
+
 	// Cross Account Endpoints for KAS (V2)
 	// Remove when legacy clients migrate to V3.
 	if !cfg.DeprecateEndpoints {

@@ -129,6 +129,35 @@ type EventsV3Response struct {
 	Events    []EventV3Item `json:"events"`
 }
 
+// InstanceOutcome summarizes the ICMSRequest lane for one icms_request_id:
+// the latest event (the outcome) plus the full ICMSRequest event history.
+type InstanceOutcome struct {
+	Context     string        `json:"context"`
+	ClusterID   string        `json:"cluster_id,omitempty"`
+	InstanceID  string        `json:"instance_id,omitempty"`
+	LatestEvent string        `json:"latest_event"`
+	Timestamp   time.Time     `json:"timestamp"`
+	Events      []EventV3Item `json:"events"`
+}
+
+// InstanceSummaryEvent is a Pod-lane event annotated with the context (pod)
+// it belongs to, so consumers can attribute events to a specific pod.
+type InstanceSummaryEvent struct {
+	Context string `json:"context"`
+	EventV3Item
+}
+
+// InstanceSummaryResponse is the response for
+// GET /v3/ledger/namespace/{namespace}/instance-summary?icms_request_id=...
+// It joins the ICMSRequest lane (outcome) with the Pod lane (pod_events) on
+// icms_request_id, read-only. Outcome is nil when no ICMSRequest row exists yet.
+type InstanceSummaryResponse struct {
+	Namespace     string                 `json:"namespace"`
+	ICMSRequestID string                 `json:"icms_request_id"`
+	Outcome       *InstanceOutcome       `json:"outcome"`
+	PodEvents     []InstanceSummaryEvent `json:"pod_events"`
+}
+
 // Object kinds that drive kind-aware context formation. Values match the
 // k8s.object.kind attribute emitted by the NVCA OTel collector.
 const (
@@ -210,6 +239,24 @@ func stringAttr(attrs map[string]any, key string) string {
 		return v
 	}
 	return ""
+}
+
+// parseCanonicalContext parses a canonical context string ("k1=v1,k2=v2") back
+// into a field->value map. It is the inverse of eventContextToCanonical and is
+// used by the instance-summary join to inspect context fields (e.g. detect the
+// ICMSRequest lane via icms_request_id). Malformed segments are ignored.
+func parseCanonicalContext(ctx string) map[string]string {
+	fields := make(map[string]string)
+	if ctx == "" {
+		return fields
+	}
+	for _, part := range strings.Split(ctx, ",") {
+		key, value, ok := strings.Cut(part, "=")
+		if ok && key != "" {
+			fields[key] = value
+		}
+	}
+	return fields
 }
 
 // cloudEventWireFormat represents the CloudEvents extensions wire format
@@ -1050,6 +1097,179 @@ func (s *Server) GetEventsV3(w http.ResponseWriter, r *http.Request) {
 		zap.Int("event_count", len(response.Events)))
 
 	sendJSONResponse(w, http.StatusOK, response)
+}
+
+// eventRecordToItem converts a stored events_v3 record into an API item,
+// tolerating empty or malformed details (returns empty EventDetails).
+func eventRecordToItem(traceCtx context.Context, logger *logging.TraceLogger, record data_access.EventV3Record) EventV3Item {
+	var details EventDetails
+	if len(record.Details) > 0 {
+		if err := json.Unmarshal(record.Details, &details); err != nil {
+			logger.WarnContext(traceCtx, "Failed to unmarshal event details, using empty details",
+				zap.Error(err),
+				zap.String("event_name", record.EventName),
+				zap.Time("timestamp", record.Timestamp))
+			details = EventDetails{}
+		}
+	}
+	return EventV3Item{
+		EventName: record.EventName,
+		Source:    record.Source,
+		Timestamp: record.Timestamp,
+		Details:   details,
+		CreatedAt: record.CreatedAt,
+		UpdatedAt: record.UpdatedAt,
+	}
+}
+
+// GetInstanceSummaryV3 handles GET /v3/ledger/namespace/{namespace}/instance-summary?icms_request_id=...
+// It joins, on read, the ICMSRequest lane (outcome) with the Pod lane
+// (pod_events) using icms_request_id, without changing ingest or the existing
+// /stats and /events endpoints.
+//
+// The join works within a namespace: stats_v3 lists every context, the
+// ICMSRequest lane carries icms_request_id in its context, and Pod-lane events
+// carry icms_request_id in details.attributes. This holds for both container
+// and helm (MiniService grain) functions.
+func (s *Server) GetInstanceSummaryV3(w http.ResponseWriter, r *http.Request) {
+	traceCtx := r.Context()
+	logger := logging.GetLogger(traceCtx)
+
+	vars := mux.Vars(r)
+	namespace := vars["namespace"]
+	if namespace == "" {
+		sendProblemDetail(w, http.StatusBadRequest, "Bad Request", "namespace is required")
+		return
+	}
+
+	if !middleware.IsTenantAuthorized(traceCtx, namespace) {
+		sendProblemDetail(w, http.StatusForbidden, "Forbidden", "tenant is not authorized")
+		return
+	}
+
+	icmsRequestID := r.URL.Query().Get(contextFieldICMSRequestID)
+	if icmsRequestID == "" {
+		sendProblemDetail(w, http.StatusBadRequest, "Bad Request", "icms_request_id is required")
+		return
+	}
+
+	// One partition read lists every context in the namespace.
+	statsRecords, err := s.conns.DbHandlerV2.GetStatsV3(traceCtx, namespace)
+	if err != nil {
+		logger.ErrorContext(traceCtx, "Failed to retrieve stats for instance summary",
+			zap.Error(err), zap.String("namespace", namespace))
+		sendProblemDetail(w, http.StatusInternalServerError, "Internal Server Error",
+			"Failed to retrieve instance summary from database")
+		return
+	}
+
+	response := InstanceSummaryResponse{
+		Namespace:     namespace,
+		ICMSRequestID: icmsRequestID,
+		PodEvents:     []InstanceSummaryEvent{},
+	}
+
+	for _, stat := range statsRecords {
+		fields := parseCanonicalContext(stat.Context)
+
+		if fields[contextFieldICMSRequestID] == icmsRequestID {
+			// ICMSRequest lane: this context is the request outcome.
+			s.appendICMSOutcome(traceCtx, logger, &response, namespace, stat.Context, fields)
+			continue
+		}
+
+		// Pod lane candidate: icms_request_id lives in details, not the context.
+		s.appendMatchingPodEvents(traceCtx, logger, &response, namespace, stat.Context, icmsRequestID)
+	}
+
+	// Most recent first.
+	sort.Slice(response.PodEvents, func(i, j int) bool {
+		return response.PodEvents[i].Timestamp.After(response.PodEvents[j].Timestamp)
+	})
+
+	logger.InfoContext(traceCtx, "Successfully built instance summary",
+		zap.String("namespace", namespace),
+		zap.String("icms_request_id", icmsRequestID),
+		zap.Bool("has_outcome", response.Outcome != nil),
+		zap.Int("pod_event_count", len(response.PodEvents)))
+
+	sendJSONResponse(w, http.StatusOK, response)
+}
+
+// appendICMSOutcome fetches the ICMSRequest lane events for one context and folds
+// them into the response outcome, keeping the latest event across contexts.
+func (s *Server) appendICMSOutcome(traceCtx context.Context, logger *logging.TraceLogger,
+	response *InstanceSummaryResponse, namespace, eventContext string, fields map[string]string,
+) {
+	records, err := s.conns.DbHandlerV2.GetEventsV3(traceCtx, namespace, eventContext)
+	if err != nil {
+		logger.WarnContext(traceCtx, "Failed to fetch ICMSRequest events for instance summary",
+			zap.Error(err), zap.String("namespace", namespace), zap.String("context", eventContext))
+		return
+	}
+
+	if response.Outcome == nil {
+		response.Outcome = &InstanceOutcome{
+			Context:    eventContext,
+			ClusterID:  fields[contextFieldClusterID],
+			InstanceID: fields[contextFieldInstanceID],
+			Events:     []EventV3Item{},
+		}
+	}
+
+	for _, record := range records {
+		item := eventRecordToItem(traceCtx, logger, record)
+		response.Outcome.Events = append(response.Outcome.Events, item)
+		if item.Timestamp.After(response.Outcome.Timestamp) {
+			response.Outcome.Timestamp = item.Timestamp
+			response.Outcome.LatestEvent = item.EventName
+			// The context holding the latest event is the primary one.
+			response.Outcome.Context = eventContext
+			response.Outcome.ClusterID = fields[contextFieldClusterID]
+			response.Outcome.InstanceID = fields[contextFieldInstanceID]
+		}
+	}
+
+	// Keep the outcome's own event history most-recent-first.
+	sort.Slice(response.Outcome.Events, func(i, j int) bool {
+		return response.Outcome.Events[i].Timestamp.After(response.Outcome.Events[j].Timestamp)
+	})
+}
+
+// appendMatchingPodEvents fetches a Pod-lane context's events and appends those
+// correlated to icmsRequestID (via details.attributes.icms_request_id).
+func (s *Server) appendMatchingPodEvents(traceCtx context.Context, logger *logging.TraceLogger,
+	response *InstanceSummaryResponse, namespace, eventContext, icmsRequestID string,
+) {
+	records, err := s.conns.DbHandlerV2.GetEventsV3(traceCtx, namespace, eventContext)
+	if err != nil {
+		logger.WarnContext(traceCtx, "Failed to fetch Pod events for instance summary",
+			zap.Error(err), zap.String("namespace", namespace), zap.String("context", eventContext))
+		return
+	}
+
+	for _, record := range records {
+		item := eventRecordToItem(traceCtx, logger, record)
+		if attrICMSRequestID(item.Details) != icmsRequestID {
+			continue
+		}
+		response.PodEvents = append(response.PodEvents, InstanceSummaryEvent{
+			Context:     eventContext,
+			EventV3Item: item,
+		})
+	}
+}
+
+// attrICMSRequestID returns the icms_request_id stored in an event's details
+// attributes, or "" when absent or not a string.
+func attrICMSRequestID(details EventDetails) string {
+	if details.Attributes == nil {
+		return ""
+	}
+	if v, ok := details.Attributes[contextFieldICMSRequestID].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // sendProblemDetail sends an RFC 9457 problem details response

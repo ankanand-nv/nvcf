@@ -1316,6 +1316,14 @@ func (c *CassandraHandler) upsertPartitionStatsV3(traceCtx context.Context, name
 			// Full atomicity (conditional LWT) is tracked as a follow-up.
 			if ts, exists := existingTimestamp[ev.Context]; exists && ev.Timestamp.Before(ts) {
 				skipped++
+				// Context carries the identifying fields (cluster_id, instance_id,
+				// icms_request_id, ...), so log it to keep skipped rows traceable.
+				logger.DebugContext(traceCtx, "Skipping out-of-order stats event",
+					zap.String("namespace", ev.Namespace),
+					zap.String("context", ev.Context),
+					zap.String("event_name", ev.EventName),
+					zap.Time("event_timestamp", ev.Timestamp),
+					zap.Time("existing_timestamp", ts))
 				continue
 			}
 			createdAt := ev.Timestamp

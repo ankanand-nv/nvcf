@@ -51,7 +51,10 @@ func (r *Reconciler) translateWorkload(
 		InstanceTypeLabelSelectorKey: nodefeatures.UniformInstanceTypeLabelKey,
 		WorkloadResources:            corev1.ResourceRequirements{},
 		Tolerations:                  append([]corev1.Toleration(nil), r.cfg.Workload.Tolerations...),
-		OTelResources:                k8sutil.GetContainerResourcesBYOO(r.cfg),
+		OTelResources: mergeBYOOResources(
+			k8sutil.GetContainerResourcesBYOO(r.cfg),
+			ms.Spec.WorkloadConfig.GetBYOOResources(),
+		),
 		FluentbitResources:           k8sutil.GetContainerResourcesFluentBit(r.cfg),
 		FluentbitEnabled:             r.FeatureFlagFetcher.IsFeatureFlagEnabled(featureflag.BYOOFluentBit),
 		ClusterRegion:                r.ClusterRegion,
@@ -125,6 +128,40 @@ func (r *Reconciler) translateTaskWorkload(
 		return nil, err
 	}
 	return metaToClientObjs(objs), nil
+}
+
+// mergeBYOOResources overlays a per-workload BYOO collector resource override on top of
+// the cluster-level default. Only the resource keys present in the override are replaced,
+// so a function can bump e.g. memory while keeping the default CPU. A nil override returns
+// the base unchanged. As a safety net, any limit that ends up below its request is raised
+// to the request so the resulting container spec stays valid.
+func mergeBYOOResources(
+	base corev1.ResourceRequirements,
+	override *corev1.ResourceRequirements,
+) corev1.ResourceRequirements {
+	if override == nil {
+		return base
+	}
+	out := *base.DeepCopy()
+	apply := func(dst *corev1.ResourceList, src corev1.ResourceList) {
+		if len(src) == 0 {
+			return
+		}
+		if *dst == nil {
+			*dst = corev1.ResourceList{}
+		}
+		for name, q := range src {
+			(*dst)[name] = q.DeepCopy()
+		}
+	}
+	apply(&out.Requests, override.Requests)
+	apply(&out.Limits, override.Limits)
+	for name, req := range out.Requests {
+		if lim, ok := out.Limits[name]; ok && req.Cmp(lim) > 0 {
+			out.Limits[name] = req.DeepCopy()
+		}
+	}
+	return out
 }
 
 func metaToClientObjs(mobjs []metav1.Object) (cobjs []client.Object) {
